@@ -3,7 +3,7 @@ const cors = require('cors');
 
 const { fetchChannels, isSportsChannel, isKidsChannel, toChannelMeta, getChannelStats } = require('./channels');
 const { fetchEvents, toEventMeta, getEventById, isSoccerEvent, getScheduleStats } = require('./schedule');
-const { resolveEventStreams } = require('./dlhd');
+const { resolveEventStreams, getStreamCacheStats } = require('./dlhd');
 const { toProxyUrl, probeUpstream, createProxyHandler } = require('./proxy');
 
 const app = express();
@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 7000;
 
 const MANIFEST = {
   id: 'org.stremio.sportslive',
-  version: '2.0.1',
+  version: '2.0.2',
   name: '🏟️ Sports Live TV',
   description: 'Live match schedule (dlhd.pk style) plus verified 24/7 sports, kids and entertainment channels.',
   resources: ['stream', 'catalog', 'meta'],
@@ -83,6 +83,7 @@ app.get('/debug', async (req, res) => {
       fetchStats: channelStats.lastFetchStats
     },
     sampleEvent: sampleEventDetail,
+    streamCache: getStreamCacheStats(),
     sampleChannels: channels.slice(0, 5).map(c => ({ name: c.name, group: c.group })),
     proxyTest
   });
@@ -133,7 +134,7 @@ app.get('/stream/:type/:id.json', async (req, res) => {
   if (type !== 'tv') return res.json({ streams: [] });
 
   if (id.startsWith('live:')) {
-    const event = getEventById(id);
+    const event = getEventById(id, true);
     if (!event) return res.json({ streams: [] });
 
     const withIds = event.channels.filter(c => c.channel_id);
@@ -151,7 +152,15 @@ app.get('/stream/:type/:id.json', async (req, res) => {
 
     const resolved = await resolveEventStreams(withIds);
     if (resolved.length === 0) {
-      return res.json({ streams: [] });
+      return res.json({
+        streams: [{
+          name: '⏳ Retry in a moment',
+          title: event.title,
+          description: 'DLHD stream lookup timed out — tap play again. Upstream may be rate-limiting.',
+          url: '',
+          behaviorHints: { notWebReady: true }
+        }]
+      });
     }
 
     return res.json({

@@ -412,7 +412,16 @@ function toEventMeta(event) {
   };
 }
 
-function getEventById(id) {
+function getEventById(id, forStream = false) {
+  const ev = eventCache.find(e => e.id === id);
+  if (!ev) return null;
+  if (forStream) {
+    const now = Math.floor(Date.now() / 1000);
+    const pastWindow = 4 * 3600;
+    const futureWindow = 24 * 3600;
+    if (ev.startTs >= now - pastWindow && ev.startTs <= now + futureWindow) return ev;
+    return null;
+  }
   return filterActiveEvents(eventCache).find(e => e.id === id) || null;
 }
 
