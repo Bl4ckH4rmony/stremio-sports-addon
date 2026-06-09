@@ -1,7 +1,16 @@
+const fs = require('fs');
+const path = require('path');
 const fetch = require('node-fetch');
 
 const DLHD_BASE = process.env.DLHD_BASE_URL || 'https://dlhd.pk';
 const SCHEDULE_CACHE_TTL = 5 * 60 * 1000;
+const STALE_CACHE_TTL = 8 * 60 * 60 * 1000;
+const CACHE_FILE = path.join(__dirname, '..', 'schedule-cache.json');
+const SCHEDULE_BASES = [
+  DLHD_BASE,
+  'https://www.livetvon.pk',
+  'https://livetvon.pk'
+];
 const DISPLAY_TZ = process.env.TZ || 'Africa/Johannesburg';
 // dlhd.pk header says "UK GMT" — times are UTC+0 year-round, not Europe/London BST
 const SCHEDULE_TZ = process.env.SCHEDULE_TZ || 'GMT';
@@ -19,6 +28,38 @@ let cacheTime = 0;
 let lastSource = 'none';
 let lastFetchError = null;
 let lastParseStats = null;
+let refreshInFlight = null;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function loadPersistedCache() {
+  try {
+    if (!fs.existsSync(CACHE_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+    if (!data.events?.length) return;
+    if (Date.now() - data.cacheTime > STALE_CACHE_TTL) return;
+    eventCache = data.events;
+    cacheTime = data.cacheTime;
+    lastSource = data.source || 'persisted';
+    console.log(`📅 Loaded ${eventCache.length} cached events from disk (${Math.round((Date.now() - cacheTime) / 60000)}m old)`);
+  } catch (err) {
+    console.error(`Schedule cache load failed: ${err.message}`);
+  }
+}
+
+function persistCache() {
+  try {
+    fs.writeFileSync(CACHE_FILE, JSON.stringify({
+      events: eventCache,
+      cacheTime,
+      source: lastSource
+    }));
+  } catch (err) {
+    console.error(`Schedule cache save failed: ${err.message}`);
+  }
+}
 
 function makeEventId(title, timestamp) {
   const raw = title + String(timestamp);
@@ -278,30 +319,33 @@ async function fetchFromJsonEndpoint() {
   return null;
 }
 
+async function fetchHtmlFromBase(base) {
+  const res = await fetch(`${base}/`, {
+    headers: { ...FETCH_HEADERS, Referer: `${base}/`, Origin: base.replace(/\/$/, '') },
+    redirect: 'follow',
+    timeout: 20000
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+  if (!html.includes('schedule__dayTitle') || !html.includes('schedule__eventTitle')) {
+    throw new Error('No schedule markup in response');
+  }
+  return { html, base };
+}
+
 async function fetchHtmlFromSources() {
-  const bases = [
-    DLHD_BASE,
-    'https://dlhd.sx',
-    'https://www.livetvon.pk'
-  ];
-  const seen = new Set();
-  for (const base of bases) {
-    if (seen.has(base)) continue;
-    seen.add(base);
-    try {
-      const res = await fetch(`${base}/`, {
-        headers: { ...FETCH_HEADERS, Referer: `${base}/`, Origin: base.replace(/\/$/, '') },
-        redirect: 'follow',
-        timeout: 30000
-      });
-      if (!res.ok) continue;
-      const html = await res.text();
-      if (html.includes('schedule__dayTitle') && html.includes('schedule__eventTitle')) {
-        return { html, base };
-      }
-    } catch (err) {
-      console.error(`DLHD HTML ${base}: ${err.message}`);
+  const bases = [...new Set(SCHEDULE_BASES)];
+  for (let round = 0; round < 3; round++) {
+    const results = await Promise.allSettled(bases.map(base => fetchHtmlFromBase(base)));
+    for (const result of results) {
+      if (result.status === 'fulfilled') return result.value;
     }
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        console.error(`DLHD HTML attempt ${round + 1}: ${result.reason?.message || result.reason}`);
+      }
+    }
+    if (round < 2) await sleep(1500 * (round + 1));
   }
   throw new Error('No schedule HTML source responded');
 }
@@ -347,52 +391,87 @@ async function enrichChannelsFromApi(events) {
   }
 }
 
-async function fetchEvents() {
-  if (eventCache.length > 0 && Date.now() - cacheTime < SCHEDULE_CACHE_TTL) {
-    return filterActiveEvents(eventCache);
-  }
-
+async function pullSchedule() {
   let events = [];
   lastFetchError = null;
 
   try {
     events = await fetchFromApi();
-    if (events && events.length > 0) lastSource = 'api';
+    if (events?.length > 0) lastSource = 'api';
   } catch (err) {
     lastFetchError = err.message;
     console.error(`DLHD API: ${err.message}`);
   }
 
-  if (!events || events.length === 0) {
+  if (!events?.length) {
     try {
       events = await fetchFromJsonEndpoint();
-      if (events && events.length > 0) lastSource = 'json';
+      if (events?.length > 0) lastSource = 'json';
     } catch (err) {
       console.error(`DLHD JSON endpoint: ${err.message}`);
     }
   }
 
-  if (!events || events.length === 0) {
-    try {
-      events = await fetchFromHtml();
-      lastSource = 'html';
-      events = await enrichChannelsFromApi(events);
-    } catch (err) {
-      lastFetchError = err.message;
-      console.error(`DLHD HTML: ${err.message}`);
-    }
+  if (!events?.length) {
+    events = await fetchFromHtml();
+    lastSource = 'html';
+    events = await enrichChannelsFromApi(events);
   }
 
-  if (events && events.length > 0) {
+  if (events?.length > 0) {
     eventCache = events;
     cacheTime = Date.now();
+    persistCache();
     const active = filterActiveEvents(events);
     console.log(`📅 Schedule: ${active.length} active events (source: ${lastSource}, total parsed: ${events.length})`);
     return active;
   }
 
-  if (eventCache.length > 0) return filterActiveEvents(eventCache);
-  return [];
+  throw new Error(lastFetchError || 'Schedule fetch returned no events');
+}
+
+function refreshScheduleInBackground() {
+  if (refreshInFlight) return refreshInFlight;
+  refreshInFlight = pullSchedule()
+    .catch(err => {
+      lastFetchError = err.message;
+      console.error(`DLHD background refresh: ${err.message}`);
+      return filterActiveEvents(eventCache);
+    })
+    .finally(() => { refreshInFlight = null; });
+  return refreshInFlight;
+}
+
+async function fetchEvents() {
+  const age = cacheTime ? Date.now() - cacheTime : Infinity;
+
+  if (eventCache.length > 0 && age < SCHEDULE_CACHE_TTL) {
+    return filterActiveEvents(eventCache);
+  }
+
+  if (eventCache.length > 0 && age < STALE_CACHE_TTL) {
+    refreshScheduleInBackground();
+    return filterActiveEvents(eventCache);
+  }
+
+  try {
+    return await pullSchedule();
+  } catch (err) {
+    lastFetchError = err.message;
+    console.error(`DLHD HTML: ${err.message}`);
+    if (eventCache.length > 0) return filterActiveEvents(eventCache);
+    return [];
+  }
+}
+
+function startSchedulePoller() {
+  loadPersistedCache();
+  refreshScheduleInBackground();
+  setInterval(() => {
+    if (eventCache.length === 0 || Date.now() - cacheTime >= SCHEDULE_CACHE_TTL) {
+      refreshScheduleInBackground();
+    }
+  }, 90 * 1000);
 }
 
 function toEventMeta(event) {
@@ -437,6 +516,8 @@ function getScheduleStats() {
     source: lastSource,
     cacheAgeSeconds: cacheTime ? Math.round((Date.now() - cacheTime) / 1000) : null,
     nextRefreshSec: cacheTime ? Math.max(0, Math.round((SCHEDULE_CACHE_TTL - (Date.now() - cacheTime)) / 1000)) : 0,
+    staleCacheSeconds: cacheTime ? Math.round((Date.now() - cacheTime) / 1000) : null,
+    usingStaleCache: cacheTime ? Date.now() - cacheTime >= SCHEDULE_CACHE_TTL : false,
     error: lastFetchError,
     timezone: DISPLAY_TZ,
     scheduleTimezone: SCHEDULE_TZ,
@@ -453,5 +534,6 @@ module.exports = {
   getScheduleStats,
   formatDisplayTime,
   DISPLAY_TZ,
-  parseStructuredHtmlSchedule
+  parseStructuredHtmlSchedule,
+  startSchedulePoller
 };

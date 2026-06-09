@@ -2,7 +2,7 @@ const express = require('express');
 const cors = require('cors');
 
 const { fetchChannels, isSportsChannel, isKidsChannel, toChannelMeta, getChannelStats } = require('./channels');
-const { fetchEvents, toEventMeta, getEventById, isSoccerEvent, getScheduleStats } = require('./schedule');
+const { fetchEvents, toEventMeta, getEventById, isSoccerEvent, getScheduleStats, startSchedulePoller } = require('./schedule');
 const { resolveEventStreams, getStreamCacheStats } = require('./dlhd');
 const { toProxyUrl, probeUpstream, createProxyHandler } = require('./proxy');
 
@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 7000;
 
 const MANIFEST = {
   id: 'org.stremio.sportslive',
-  version: '2.0.3',
+  version: '2.0.4',
   name: '🏟️ Sports Live TV',
   description: 'Live match schedule (dlhd.pk style) plus verified 24/7 sports, kids and entertainment channels.',
   resources: ['stream', 'catalog', 'meta'],
@@ -194,5 +194,5 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Running on port ${PORT} (v${MANIFEST.version}, TZ=${process.env.TZ || 'Africa/Johannesburg'})`);
   fetchChannels();
-  fetchEvents();
+  startSchedulePoller();
 });

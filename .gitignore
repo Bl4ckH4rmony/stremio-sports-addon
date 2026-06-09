@@ -1,3 +1,4 @@
 node_modules/
 .env
 tmp-*.html
+schedule-cache.json
