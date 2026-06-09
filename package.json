@@ -1,0 +1,17 @@
+{
+  "name": "stremio-sports-addon",
+  "version": "1.0.0",
+  "description": "Stremio Live Sports & TV addon powered by DaddyLive",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
