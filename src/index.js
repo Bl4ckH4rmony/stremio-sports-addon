@@ -7,29 +7,19 @@ app.use(cors());
 
 const PORT = process.env.PORT || 7000;
 
-const STREAM_HEADERS = {
-  'Referer': 'https://cookiewebplay.xyz/',
-  'Origin': 'https://cookiewebplay.xyz',
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-};
-
-const ALLOWED_HOSTS = ['mizhls.ru'];
-
+// iptv-org playlists — community-maintained, updated daily
 const M3U_URLS = [
-  // pigzillaaa - verified working raw URLs
-  'https://raw.githubusercontent.com/pigzillaaa/daddylive/refs/heads/main/daddylive-channels.m3u8',
-  'https://raw.githubusercontent.com/pigzillaaa/daddylive/refs/heads/main/daddylive-events.m3u8',
-  // ICEZOMBIE - another active mirror
-  'https://raw.githubusercontent.com/ICEZOMBIE-m3u/Daddylive-m3u/main/Playlist.m3u8',
-  // aphrodite747
-  'https://raw.githubusercontent.com/aphrodite747/daddylive-m3u/main/playlist.m3u8',
+  { name: 'US Samsung TV', url: 'https://raw.githubusercontent.com/iptv-org/iptv/master/streams/us_samsung.m3u' },
+  { name: 'US', url: 'https://raw.githubusercontent.com/iptv-org/iptv/master/streams/us.m3u' },
+  { name: 'UK', url: 'https://raw.githubusercontent.com/iptv-org/iptv/master/streams/uk.m3u' },
+  { name: 'Canada', url: 'https://raw.githubusercontent.com/iptv-org/iptv/master/streams/ca.m3u' },
 ];
 
 const MANIFEST = {
   id: 'org.stremio.sportslive',
-  version: '1.3.0',
+  version: '1.4.0',
   name: '🏟️ Sports Live TV',
-  description: 'Live sports and TV channels via DaddyLive. Premier League, NFL, NBA, UFC, Cricket and more.',
+  description: 'Live sports channels with verified working streams from iptv-org. Streams are tested before listing.',
   resources: ['stream', 'catalog', 'meta'],
   types: ['tv'],
   catalogs: [
@@ -49,20 +39,109 @@ const MANIFEST = {
   idPrefixes: ['sportslive:']
 };
 
+const VALIDATE_CONCURRENCY = 12;
+const VALIDATE_TIMEOUT = 8000;
+const MAX_VALIDATE = 200;
+const CACHE_TTL = 30 * 60 * 1000;
+
 let channelCache = null;
 let cacheTime = 0;
-const CACHE_TTL = 15 * 60 * 1000;
+let lastFetchStats = null;
+const validatedHosts = new Set();
 
 async function fetchFromUrl(url) {
   const res = await fetch(url, {
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     redirect: 'follow',
-    timeout: 10000
+    timeout: 15000
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const text = await res.text();
   if (!text.includes('#EXTINF')) throw new Error('Not a valid M3U');
   return text;
+}
+
+function parseM3U(text, sourceName) {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const channels = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('#EXTINF')) {
+      const info = lines[i];
+      const url = lines[i + 1];
+      if (!url || url.startsWith('#') || !url.startsWith('http')) continue;
+
+      const nameMatch = info.match(/,(.+)$/);
+      const logoMatch = info.match(/tvg-logo="([^"]+)"/);
+      const groupMatch = info.match(/group-title="([^"]+)"/);
+
+      const name = nameMatch ? nameMatch[1].trim() : 'Unknown';
+      const logo = logoMatch ? logoMatch[1] : null;
+      const group = groupMatch ? groupMatch[1] : sourceName;
+
+      const id = 'sportslive:' + Buffer.from(name + url).toString('base64').replace(/[^a-zA-Z0-9]/g, '').substring(0, 40);
+
+      channels.push({ id, name, logo, group, url, source: sourceName });
+      i++;
+    }
+  }
+  return channels;
+}
+
+function getStreamHeaders(url) {
+  const host = new URL(url).hostname;
+  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+  if (host.endsWith('newkso.ru') || host.endsWith('mizhls.ru')) {
+    return { Referer: 'https://cookiewebplay.xyz/', Origin: 'https://cookiewebplay.xyz', 'User-Agent': ua };
+  }
+  if (host.endsWith('thetvapp.to')) {
+    return { Referer: 'https://thetvapp.to/', Origin: 'https://thetvapp.to', 'User-Agent': ua };
+  }
+  return { 'User-Agent': ua };
+}
+
+async function validateStream(url) {
+  const headers = getStreamHeaders(url);
+  try {
+    const res = await fetch(url, { headers, redirect: 'follow', timeout: VALIDATE_TIMEOUT });
+    if (!res.ok) return false;
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (url.includes('.m3u8') || ct.includes('mpegurl') || ct.includes('x-mpegurl')) {
+      const text = await res.text();
+      return text.includes('#EXT');
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function validateChannels(channels) {
+  const sportsFirst = [...channels].sort((a, b) => {
+    const aSport = isSportsChannel(a) ? 0 : 1;
+    const bSport = isSportsChannel(b) ? 0 : 1;
+    return aSport - bSport;
+  });
+
+  const toCheck = sportsFirst.slice(0, MAX_VALIDATE);
+  const working = [];
+  let checked = 0;
+  let index = 0;
+
+  async function worker() {
+    while (index < toCheck.length) {
+      const i = index++;
+      const ch = toCheck[i];
+      checked++;
+      if (await validateStream(ch.url)) {
+        validatedHosts.add(new URL(ch.url).hostname);
+        working.push(ch);
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: VALIDATE_CONCURRENCY }, () => worker()));
+  return { working, checked, total: channels.length };
 }
 
 async function fetchChannels() {
@@ -71,20 +150,22 @@ async function fetchChannels() {
   }
 
   const allChannels = [];
+  const sourceStats = {};
 
-  for (const url of M3U_URLS) {
+  for (const { name, url } of M3U_URLS) {
     try {
-      console.log(`Trying: ${url}`);
+      console.log(`Fetching playlist: ${name}`);
       const text = await fetchFromUrl(url);
-      const channels = parseM3U(text);
-      console.log(`✅ Got ${channels.length} channels from ${url}`);
+      const channels = parseM3U(text, name);
+      console.log(`  Parsed ${channels.length} channels from ${name}`);
       allChannels.push(...channels);
+      sourceStats[name] = { parsed: channels.length, error: null };
     } catch (err) {
-      console.error(`❌ Failed ${url}: ${err.message}`);
+      console.error(`  Failed ${name}: ${err.message}`);
+      sourceStats[name] = { parsed: 0, error: err.message };
     }
   }
 
-  // Dedupe by name
   const seen = new Set();
   const unique = allChannels.filter(ch => {
     if (seen.has(ch.name)) return false;
@@ -92,47 +173,41 @@ async function fetchChannels() {
     return true;
   });
 
-  if (unique.length > 0) {
-    channelCache = unique;
+  console.log(`Validating streams (${Math.min(unique.length, MAX_VALIDATE)} of ${unique.length} channels)...`);
+  const { working, checked } = await validateChannels(unique);
+
+  const seenWorking = new Set();
+  const dedupedWorking = working.filter(ch => {
+    if (seenWorking.has(ch.name)) return false;
+    seenWorking.add(ch.name);
+    return true;
+  });
+
+  if (dedupedWorking.length > 0) {
+    channelCache = dedupedWorking;
     cacheTime = Date.now();
-    console.log(`Total unique channels: ${unique.length}`);
+    console.log(`✅ ${dedupedWorking.length} working channels (${dedupedWorking.filter(isSportsChannel).length} sports)`);
+  } else {
+    console.error('⚠️ No working streams found — keeping previous cache if available');
   }
+
+  lastFetchStats = {
+    sources: sourceStats,
+    parsed: unique.length,
+    validated: checked,
+    working: dedupedWorking.length,
+    sports: dedupedWorking.filter(isSportsChannel).length
+  };
 
   return channelCache || [];
-}
-
-function parseM3U(text) {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const channels = [];
-
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].startsWith('#EXTINF')) {
-      const info = lines[i];
-      const url = lines[i + 1];
-      if (!url || url.startsWith('#')) continue;
-
-      const nameMatch = info.match(/,(.+)$/);
-      const logoMatch = info.match(/tvg-logo="([^"]+)"/);
-      const groupMatch = info.match(/group-title="([^"]+)"/);
-
-      const name = nameMatch ? nameMatch[1].trim() : 'Unknown';
-      const logo = logoMatch ? logoMatch[1] : null;
-      const group = groupMatch ? groupMatch[1] : 'Other';
-
-      const id = 'sportslive:' + Buffer.from(name + url).toString('base64').replace(/[^a-zA-Z0-9]/g, '').substring(0, 40);
-
-      channels.push({ id, name, logo, group, url });
-      i++;
-    }
-  }
-  return channels;
 }
 
 function isSportsChannel(ch) {
   const kw = ['sport', 'football', 'soccer', 'nfl', 'nba', 'nhl', 'mlb', 'espn',
     'sky sport', 'bt sport', 'tnt sport', 'dazn', 'eurosport', 'bein', 'fox sport',
     'golf', 'tennis', 'cricket', 'rugby', 'mma', 'ufc', 'boxing', 'f1', 'formula',
-    'motorsport', 'racing', 'wrestling', 'wwe', 'arena', 'score', 'supersport'];
+    'motorsport', 'racing', 'wrestling', 'wwe', 'arena', 'score', 'supersport',
+    'stadium', 'outdoor', 'nba tv', 'mlb channel', 'nfl channel', 'willow'];
   const text = (ch.name + ' ' + ch.group).toLowerCase();
   return kw.some(k => text.includes(k));
 }
@@ -151,7 +226,11 @@ function decodeProxyUrl(encoded) {
 }
 
 function isAllowedHost(hostname) {
-  return ALLOWED_HOSTS.some(h => hostname === h || hostname.endsWith('.' + h));
+  if (validatedHosts.has(hostname)) return true;
+  for (const allowed of validatedHosts) {
+    if (hostname === allowed || hostname.endsWith('.' + allowed)) return true;
+  }
+  return false;
 }
 
 function toProxyUrl(targetUrl, req) {
@@ -162,6 +241,20 @@ function isM3u8(url, contentType) {
   if (url.includes('.m3u8')) return true;
   const ct = (contentType || '').toLowerCase();
   return ct.includes('mpegurl') || ct.includes('x-mpegurl');
+}
+
+function registerManifestHosts(content, manifestUrl) {
+  const base = new URL(manifestUrl);
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('#')) {
+      const uriMatch = trimmed.match(/URI="([^"]+)"/);
+      if (uriMatch) validatedHosts.add(new URL(uriMatch[1], base).hostname);
+      continue;
+    }
+    validatedHosts.add(new URL(trimmed, base).hostname);
+  }
 }
 
 function rewriteM3u8(content, manifestUrl, req) {
@@ -184,7 +277,7 @@ function rewriteM3u8(content, manifestUrl, req) {
 
 async function probeUpstream(url) {
   try {
-    const res = await fetch(url, { headers: STREAM_HEADERS, redirect: 'follow', timeout: 10000 });
+    const res = await fetch(url, { headers: getStreamHeaders(url), redirect: 'follow', timeout: VALIDATE_TIMEOUT });
     return { status: res.status, ok: res.ok };
   } catch (err) {
     return { status: 0, ok: false, error: err.message };
@@ -209,7 +302,7 @@ app.get('/manifest.json', (req, res) => res.json(MANIFEST));
 
 app.get('/debug', async (req, res) => {
   const channels = await fetchChannels();
-  const sample = channels[0];
+  const sample = channels.find(isSportsChannel) || channels[0];
   let proxyTest = null;
 
   if (sample) {
@@ -225,10 +318,13 @@ app.get('/debug', async (req, res) => {
   }
 
   res.json({
+    version: MANIFEST.version,
     channelCount: channels.length,
-    cacheAgeSeconds: Math.round((Date.now() - cacheTime) / 1000),
+    sportsCount: channels.filter(isSportsChannel).length,
+    cacheAgeSeconds: cacheTime ? Math.round((Date.now() - cacheTime) / 1000) : null,
+    fetchStats: lastFetchStats,
     groups: [...new Set(channels.map(c => c.group))].slice(0, 20),
-    sample: channels.slice(0, 10).map(c => ({ name: c.name, group: c.group })),
+    sample: channels.slice(0, 10).map(c => ({ name: c.name, group: c.group, source: c.source })),
     proxyTest
   });
 });
@@ -253,7 +349,7 @@ app.get('/proxy', async (req, res) => {
 
   try {
     const upstream = await fetch(upstreamUrl, {
-      headers: STREAM_HEADERS,
+      headers: getStreamHeaders(upstreamUrl),
       redirect: 'follow',
       timeout: 15000
     });
@@ -267,6 +363,7 @@ app.get('/proxy', async (req, res) => {
 
     if (isM3u8(upstreamUrl, contentType)) {
       const text = await upstream.text();
+      registerManifestHosts(text, upstreamUrl);
       res.set('Content-Type', 'application/vnd.apple.mpegurl');
       res.send(rewriteM3u8(text, upstreamUrl, req));
       return;
