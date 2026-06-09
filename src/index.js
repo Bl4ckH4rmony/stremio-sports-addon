@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 7000;
 
 const MANIFEST = {
   id: 'org.stremio.sportslive',
-  version: '2.0.2',
+  version: '2.0.3',
   name: '🏟️ Sports Live TV',
   description: 'Live match schedule (dlhd.pk style) plus verified 24/7 sports, kids and entertainment channels.',
   resources: ['stream', 'catalog', 'meta'],

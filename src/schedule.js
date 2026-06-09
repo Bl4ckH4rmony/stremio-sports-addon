@@ -3,7 +3,8 @@ const fetch = require('node-fetch');
 const DLHD_BASE = process.env.DLHD_BASE_URL || 'https://dlhd.pk';
 const SCHEDULE_CACHE_TTL = 5 * 60 * 1000;
 const DISPLAY_TZ = process.env.TZ || 'Africa/Johannesburg';
-const UK_TZ = 'Europe/London';
+// dlhd.pk header says "UK GMT" — times are UTC+0 year-round, not Europe/London BST
+const SCHEDULE_TZ = process.env.SCHEDULE_TZ || 'GMT';
 const FETCH_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
   Referer: `${DLHD_BASE}/`,
@@ -46,10 +47,13 @@ function parseUkDate(header) {
   return { year: parseInt(m[4], 10), month, day: parseInt(m[2], 10) };
 }
 
-function ukLocalToUtc(year, month, day, hour, minute) {
+function scheduleTimeToUtc(year, month, day, hour, minute) {
+  if (SCHEDULE_TZ === 'GMT' || SCHEDULE_TZ === 'UTC' || SCHEDULE_TZ === 'Etc/GMT') {
+    return Math.floor(Date.UTC(year, month, day, hour, minute) / 1000);
+  }
   const probe = new Date(Date.UTC(year, month, day, hour, minute));
   const fmt = new Intl.DateTimeFormat('en-GB', {
-    timeZone: UK_TZ,
+    timeZone: SCHEDULE_TZ,
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hour12: false
   });
@@ -171,7 +175,7 @@ function parseStructuredHtmlSchedule(html) {
         const channels = parseChannelsFromHtml(evBlock);
         if (channels.length === 0) continue;
 
-        const ts = ukLocalToUtc(ey, em, ed, hour, minute);
+        const ts = scheduleTimeToUtc(ey, em, ed, hour, minute);
         events.push({
           id: makeEventId(title, ts),
           title,
@@ -209,7 +213,7 @@ function parseApiSchedule(data) {
         const channels = normalizeChannels(item.channels);
         if (channels.length === 0) continue;
 
-        const ts = ukLocalToUtc(
+        const ts = scheduleTimeToUtc(
           dateParts.year, dateParts.month, dateParts.day,
           parseInt(timeMatch[1], 10), parseInt(timeMatch[2], 10)
         );
@@ -435,6 +439,7 @@ function getScheduleStats() {
     nextRefreshSec: cacheTime ? Math.max(0, Math.round((SCHEDULE_CACHE_TTL - (Date.now() - cacheTime)) / 1000)) : 0,
     error: lastFetchError,
     timezone: DISPLAY_TZ,
+    scheduleTimezone: SCHEDULE_TZ,
     parseStats: lastParseStats
   };
 }
