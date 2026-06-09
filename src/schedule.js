@@ -4,6 +4,11 @@ const DLHD_BASE = process.env.DLHD_BASE_URL || 'https://dlhd.pk';
 const SCHEDULE_CACHE_TTL = 5 * 60 * 1000;
 const DISPLAY_TZ = process.env.TZ || 'Africa/Johannesburg';
 const UK_TZ = 'Europe/London';
+const FETCH_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+  Referer: `${DLHD_BASE}/`,
+  Origin: DLHD_BASE.replace(/\/$/, '')
+};
 
 const SOCCER_KW = ['soccer', 'football', 'fifa', 'premier', 'la liga', 'serie a', 'bundesliga',
   'champions league', 'uefa', 'friendly', 'mls', 'copa', 'ligue', 'eredivisie', 'world cup'];
@@ -12,17 +17,30 @@ let eventCache = [];
 let cacheTime = 0;
 let lastSource = 'none';
 let lastFetchError = null;
+let lastParseStats = null;
 
 function makeEventId(title, timestamp) {
   const raw = title + String(timestamp);
   return 'live:' + Buffer.from(raw).toString('base64').replace(/[^a-zA-Z0-9]/g, '').substring(0, 40);
 }
 
+function decodeHtmlEntities(str) {
+  return str
+    .replace(/&#039;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+}
+
 function parseUkDate(header) {
   const m = header.match(/(\w+)\s+(\d{1,2})(?:st|nd|rd|th)?\s+(\w+)\s+(\d{4})/i);
   if (!m) return null;
-  const months = { january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
-    july: 6, august: 7, september: 8, october: 9, november: 10, december: 11 };
+  const months = {
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5,
+    july: 6, august: 7, september: 8, october: 9, november: 10, december: 11
+  };
   const month = months[m[3].toLowerCase()];
   if (month === undefined) return null;
   return { year: parseInt(m[4], 10), month, day: parseInt(m[2], 10) };
@@ -61,20 +79,116 @@ function isSoccerEvent(event) {
 }
 
 function isLiveSportEvent(event) {
-  const skip = ['tv shows', 'ppv events', 'upcoming events'];
-  return !skip.some(s => event.category.toLowerCase().includes(s));
+  const cat = event.category.toLowerCase();
+  const skip = ['tv shows', 'ppv events'];
+  if (skip.some(s => cat.includes(s))) return false;
+  if (cat === 'upcoming events') return false;
+  return true;
 }
 
 function normalizeChannels(channels) {
   if (!channels) return [];
   const list = Array.isArray(channels) ? channels : Object.values(channels);
+  const seen = new Set();
   return list
     .map(ch => ({
       channel_name: ch.channel_name || ch.name || 'Stream',
       channel_id: String(ch.channel_id || ch.id || ''),
       logo_url: ch.logo_url || ch.logo || null
     }))
-    .filter(ch => ch.channel_id);
+    .filter(ch => ch.channel_id && ch.channel_id !== '00')
+    .filter(ch => {
+      const key = ch.channel_id + ':' + ch.channel_name.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function parseChannelsFromHtml(block) {
+  const channels = [];
+  const linkRegex = /<a[^>]+href="\/watch\.php\?id=(\d+)"[^>]*title="([^"]*)"[^>]*>/gi;
+  let match;
+  while ((match = linkRegex.exec(block)) !== null) {
+    channels.push({
+      channel_name: decodeHtmlEntities(match[2].trim()),
+      channel_id: match[1],
+      logo_url: null
+    });
+  }
+  return normalizeChannels(channels);
+}
+
+function parseStructuredHtmlSchedule(html) {
+  const events = [];
+  const dayBlocks = html.split(/<div class="schedule__day">/i).slice(1);
+
+  for (const dayBlock of dayBlocks) {
+    const dayMatch = dayBlock.match(/<div class="schedule__dayTitle">([^<]+)<\/div>/i);
+    if (!dayMatch) continue;
+    const dateParts = parseUkDate(dayMatch[1]);
+    if (!dateParts) continue;
+
+    const categoryBlocks = dayBlock.split(/<div class="schedule__category/i).slice(1);
+    for (const catBlock of categoryBlocks) {
+      const catMatch = catBlock.match(/<div class="card__meta">([^<]*)<\/div>/i);
+      const category = catMatch ? decodeHtmlEntities(catMatch[1].trim()) : 'Live';
+
+      let rollDay = false;
+      let lastHour = -1;
+      let lastMinute = -1;
+      let y = dateParts.year;
+      let m = dateParts.month;
+      let d = dateParts.day;
+
+      const eventBlocks = catBlock.split(/<div class="schedule__event">/i).slice(1);
+      for (const evBlock of eventBlocks) {
+        const timeMatch = evBlock.match(/data-time="(\d{1,2}):(\d{2})"/i);
+        const titleMatch = evBlock.match(/<span class="schedule__eventTitle">([^<]+)<\/span>/i);
+        if (!timeMatch || !titleMatch) continue;
+
+        const hour = parseInt(timeMatch[1], 10);
+        const minute = parseInt(timeMatch[2], 10);
+        const title = decodeHtmlEntities(titleMatch[1].trim());
+        if (title.length < 3) continue;
+
+        if (lastHour >= 0 && (hour < lastHour || (hour === lastHour && minute < lastMinute))) {
+          rollDay = true;
+        }
+        lastHour = hour;
+        lastMinute = minute;
+
+        let ey = y;
+        let em = m;
+        let ed = d;
+        if (rollDay) {
+          const next = new Date(Date.UTC(y, m, d + 1));
+          ey = next.getUTCFullYear();
+          em = next.getUTCMonth();
+          ed = next.getUTCDate();
+        }
+
+        const channels = parseChannelsFromHtml(evBlock);
+        if (channels.length === 0) continue;
+
+        const ts = ukLocalToUtc(ey, em, ed, hour, minute);
+        events.push({
+          id: makeEventId(title, ts),
+          title,
+          category,
+          channels,
+          startTs: ts,
+          kind: 'event'
+        });
+      }
+    }
+  }
+
+  const byId = new Map();
+  for (const ev of events) {
+    if (!byId.has(ev.id)) byId.set(ev.id, ev);
+  }
+  return [...byId.values()];
 }
 
 function parseApiSchedule(data) {
@@ -115,87 +229,6 @@ function parseApiSchedule(data) {
   return events;
 }
 
-function parseHtmlSchedule(html) {
-  const events = [];
-  const lines = html.replace(/<[^>]+>/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
-
-  let currentDate = null;
-  let currentCategory = 'Live';
-  const categoryMaxTime = {};
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    const dayMatch = line.match(/(\w+day)\s+(\d{1,2})(?:st|nd|rd|th)?\s+(\w+)\s+(\d{4})\s+-\s+Schedule/i);
-    if (dayMatch) {
-      currentDate = parseUkDate(line);
-      categoryMaxTime[currentCategory] = null;
-      continue;
-    }
-
-    if (line.length < 40 && !line.match(/^\d{1,2}:\d{2}/) && !line.includes('http')) {
-      const lower = line.toLowerCase();
-      if (!['upcoming events', 'schedule time uk gmt', 'chat', 'menu'].includes(lower)) {
-        currentCategory = line;
-        categoryMaxTime[currentCategory] = null;
-      }
-      continue;
-    }
-
-    const eventMatch = line.match(/^(\d{1,2}):(\d{2})\s+(.+)$/);
-    if (!eventMatch || !currentDate) continue;
-
-    const hour = parseInt(eventMatch[1], 10);
-    const minute = parseInt(eventMatch[2], 10);
-    const title = eventMatch[3].trim();
-    if (title.length < 3) continue;
-
-    const timeKey = `${hour}:${minute}`;
-    let rollDay = false;
-    const maxTime = categoryMaxTime[currentCategory];
-    if (maxTime && (hour < maxTime.hour || (hour === maxTime.hour && minute < maxTime.minute))) {
-      rollDay = true;
-    }
-    categoryMaxTime[currentCategory] = { hour, minute };
-
-    let y = currentDate.year, m = currentDate.month, d = currentDate.day;
-    if (rollDay) {
-      const next = new Date(Date.UTC(y, m, d + 1));
-      y = next.getUTCFullYear();
-      m = next.getUTCMonth();
-      d = next.getUTCDate();
-    }
-
-    const channels = [];
-    let j = i + 1;
-    while (j < lines.length) {
-      const next = lines[j];
-      if (/^\d{1,2}:\d{2}\s/.test(next)) break;
-      if (/(\w+day)\s+\d{1,2}/i.test(next)) break;
-      if (next.length < 50 && next === next.toUpperCase() && !next.includes(':')) break;
-      if (next.startsWith('Channel Not Listed')) { j++; continue; }
-      if (next.length > 2 && next.length < 80) {
-        channels.push({ channel_name: next, channel_id: '', logo_url: null });
-      }
-      j++;
-      if (channels.length >= 8) break;
-    }
-
-    const ts = ukLocalToUtc(y, m, d, hour, minute);
-    events.push({
-      id: makeEventId(title, ts),
-      title,
-      category: currentCategory,
-      channels,
-      startTs: ts,
-      kind: 'event',
-      htmlOnly: true
-    });
-  }
-
-  return events;
-}
-
 function filterActiveEvents(events) {
   const now = Math.floor(Date.now() / 1000);
   const pastWindow = 3 * 3600;
@@ -212,11 +245,7 @@ async function fetchFromApi() {
   if (!key) return null;
 
   const url = `${DLHD_BASE}/daddyapi.php?key=${encodeURIComponent(key)}&endpoint=schedule`;
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0', Referer: `${DLHD_BASE}/` },
-    redirect: 'follow',
-    timeout: 20000
-  });
+  const res = await fetch(url, { headers: FETCH_HEADERS, redirect: 'follow', timeout: 20000 });
   if (!res.ok) throw new Error(`API HTTP ${res.status}`);
   const data = await res.json();
   if (!data.success && !data.data) throw new Error(data.message || data.error || 'API failed');
@@ -230,16 +259,13 @@ async function fetchFromJsonEndpoint() {
   ];
   for (const url of urls) {
     try {
-      const res = await fetch(url, {
-        headers: { 'User-Agent': 'Mozilla/5.0', Referer: `${DLHD_BASE}/` },
-        redirect: 'follow',
-        timeout: 15000
-      });
+      const res = await fetch(url, { headers: FETCH_HEADERS, redirect: 'follow', timeout: 15000 });
       if (!res.ok) continue;
       const ct = res.headers.get('content-type') || '';
       const text = await res.text();
       if (ct.includes('json') || text.trim().startsWith('{')) {
-        return parseApiSchedule(JSON.parse(text));
+        const parsed = parseApiSchedule(JSON.parse(text));
+        if (parsed.length > 0) return parsed;
       }
     } catch {
       // try next
@@ -248,15 +274,42 @@ async function fetchFromJsonEndpoint() {
   return null;
 }
 
+async function fetchHtmlFromSources() {
+  const bases = [
+    DLHD_BASE,
+    'https://dlhd.sx',
+    'https://www.livetvon.pk'
+  ];
+  const seen = new Set();
+  for (const base of bases) {
+    if (seen.has(base)) continue;
+    seen.add(base);
+    try {
+      const res = await fetch(`${base}/`, {
+        headers: { ...FETCH_HEADERS, Referer: `${base}/`, Origin: base.replace(/\/$/, '') },
+        redirect: 'follow',
+        timeout: 30000
+      });
+      if (!res.ok) continue;
+      const html = await res.text();
+      if (html.includes('schedule__dayTitle') && html.includes('schedule__eventTitle')) {
+        return { html, base };
+      }
+    } catch (err) {
+      console.error(`DLHD HTML ${base}: ${err.message}`);
+    }
+  }
+  throw new Error('No schedule HTML source responded');
+}
+
 async function fetchFromHtml() {
-  const res = await fetch(`${DLHD_BASE}/`, {
-    headers: { 'User-Agent': 'Mozilla/5.0', Referer: `${DLHD_BASE}/` },
-    redirect: 'follow',
-    timeout: 25000
-  });
-  if (!res.ok) throw new Error(`HTML HTTP ${res.status}`);
-  const html = await res.text();
-  return parseHtmlSchedule(html);
+  const { html, base } = await fetchHtmlFromSources();
+  const events = parseStructuredHtmlSchedule(html);
+  lastParseStats = { totalParsed: events.length, htmlBytes: html.length, base };
+  if (events.length === 0) {
+    throw new Error(`Structured HTML parse returned 0 events from ${base}`);
+  }
+  return events;
 }
 
 async function enrichChannelsFromApi(events) {
@@ -265,7 +318,7 @@ async function enrichChannelsFromApi(events) {
 
   try {
     const res = await fetch(`${DLHD_BASE}/daddyapi.php?key=${encodeURIComponent(key)}&endpoint=channels`, {
-      headers: { 'User-Agent': 'Mozilla/5.0', Referer: `${DLHD_BASE}/` },
+      headers: FETCH_HEADERS,
       timeout: 15000
     });
     if (!res.ok) return events;
@@ -278,15 +331,13 @@ async function enrichChannelsFromApi(events) {
       }
     }
 
-    return events.map(ev => {
-      if (!ev.htmlOnly) return ev;
-      const channels = ev.channels.map(c => {
+    return events.map(ev => ({
+      ...ev,
+      channels: ev.channels.map(c => {
         const match = byName.get(c.channel_name.toLowerCase().trim());
-        if (match) return normalizeChannels([match])[0];
-        return c;
-      }).filter(c => c.channel_id);
-      return { ...ev, channels, htmlOnly: channels.length === 0 };
-    });
+        return match ? normalizeChannels([match])[0] : c;
+      }).filter(c => c.channel_id)
+    }));
   } catch {
     return events;
   }
@@ -374,7 +425,8 @@ function getScheduleStats() {
     cacheAgeSeconds: cacheTime ? Math.round((Date.now() - cacheTime) / 1000) : null,
     nextRefreshSec: cacheTime ? Math.max(0, Math.round((SCHEDULE_CACHE_TTL - (Date.now() - cacheTime)) / 1000)) : 0,
     error: lastFetchError,
-    timezone: DISPLAY_TZ
+    timezone: DISPLAY_TZ,
+    parseStats: lastParseStats
   };
 }
 
@@ -386,5 +438,6 @@ module.exports = {
   isLiveSportEvent,
   getScheduleStats,
   formatDisplayTime,
-  DISPLAY_TZ
+  DISPLAY_TZ,
+  parseStructuredHtmlSchedule
 };

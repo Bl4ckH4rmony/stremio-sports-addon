@@ -5,7 +5,11 @@ const validatedHosts = new Set();
 function getStreamHeaders(url) {
   const host = new URL(url).hostname;
   const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-  if (host.endsWith('newkso.ru') || host.endsWith('mizhls.ru')) {
+  if (
+    host.endsWith('newkso.ru') || host.endsWith('mizhls.ru') ||
+    host.includes('phantemlis') || host.includes('jimpenopisonline') ||
+    host.endsWith('.top') && host.includes('premium')
+  ) {
     return { Referer: 'https://dlhd.pk/', Origin: 'https://dlhd.pk', 'User-Agent': ua };
   }
   if (host.endsWith('thetvapp.to')) {
